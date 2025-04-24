@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"os"
 	"strings"
 	"sync"
@@ -214,13 +215,18 @@ func (hp *Honeypot) eventsAlertsController() {
 				}
 			}
 
-			start := evt.Timestamp
-			end := evt.Timestamp.Add(evt.Duration)
-			for _, alert := range hp.suricataMap[evt.IP] {
-				if alert.DestPort == evt.Port &&
-					alert.Timestamp.After(start) && alert.Timestamp.Before(end) {
-					evt.Suricata = &alert
-					break
+			alerts := hp.suricataMap[fmt.Sprintf("%s_%d", evt.IP, evt.Port)]
+			for _, alert := range alerts {
+				if evt.Port == 21 { // FTP
+					if alert.Timestamp.After(evt.Timestamp) && alert.Timestamp.Before(evt.Timestamp.Add(evt.Duration)) {
+						evt.Suricata = &alert
+						break
+					}
+				} else { // HTTP or others
+					if alert.Timestamp.After(evt.Timestamp.Add(-1*time.Second)) && alert.Timestamp.Before(evt.Timestamp.Add(3*time.Second)) {
+						evt.Suricata = &alert
+						break
+					}
 				}
 			}
 
@@ -238,7 +244,7 @@ func (hp *Honeypot) eventsAlertsController() {
 				alert.Severity,
 			)
 
-			hp.suricataMap[alert.SrcIP] = append(hp.suricataMap[alert.SrcIP], alert)
+			hp.suricataMap[fmt.Sprintf("%s_%d", alert.SrcIP, alert.DestPort)] = append(hp.suricataMap[fmt.Sprintf("%s_%d", alert.SrcIP, alert.DestPort)], alert)
 
 		}
 	}
@@ -246,9 +252,12 @@ func (hp *Honeypot) eventsAlertsController() {
 
 func (hp *Honeypot) Start() {
 	for _, port := range hp.ports {
-		if port == 21 {
+		switch port {
+		case 21:
 			go hp.listenFTP(port)
-		} else {
+		case 80:
+			go hp.startHTTPHoneypot(port)
+		default:
 			go hp.listenOnPort(port)
 		}
 	}
@@ -261,4 +270,109 @@ func main() {
 	hp.Start()
 
 	select {} // Block forever
+}
+
+func (hp *Honeypot) startHTTPHoneypot(port int) {
+	mux := http.NewServeMux()
+
+	wrap := func(handler func(http.ResponseWriter, *http.Request) string) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			info := handler(w, r)
+			ip := strings.Split(r.RemoteAddr, ":")[0]
+			hp.events <- Event{
+				Timestamp: time.Now(),
+				IP:        ip,
+				Port:      port,
+				Payload:   fmt.Sprintf("%s %s > %s", r.Method, r.URL.Path, info),
+			}
+		}
+	}
+
+	mux.HandleFunc("/login", wrap(fakeLogin))
+	mux.HandleFunc("/search", wrap(sqlInjectionBait))
+	mux.HandleFunc("/comment", wrap(xssBait))
+	mux.HandleFunc("/admin", wrap(fakeAdmin))
+	mux.HandleFunc("/upload", wrap(fakeUpload))
+	mux.HandleFunc("/config", wrap(leakConfig))
+	mux.HandleFunc("/robots.txt", wrap(serveRobots))
+	mux.HandleFunc("/backup.zip", wrap(fakeDownload))
+	mux.HandleFunc("/shell.php", wrap(fakeShell))
+
+	addr := fmt.Sprintf(":%d", port)
+	fmt.Println("[*] HTTP honeypot running on", addr)
+	http.ListenAndServe(addr, mux)
+}
+
+func fakeLogin(w http.ResponseWriter, r *http.Request) string {
+	if r.Method == "POST" {
+		r.ParseForm()
+		username := r.FormValue("username")
+		password := r.FormValue("password")
+		fmt.Fprintln(w, "Login failed.")
+		return fmt.Sprintf("Login attempt: %s / %s", username, password)
+	}
+	fmt.Fprintln(w, "<form method='POST'>Username: <input name='username'/><br/>Password: <input name='password' type='password'/><br/><input type='submit'/></form>")
+	return "Login form served"
+}
+
+func sqlInjectionBait(w http.ResponseWriter, r *http.Request) string {
+	q := r.URL.Query().Get("q")
+	fmt.Fprintf(w, "Results for '%s': No results found.", q)
+	return fmt.Sprintf("Search query: %s", q)
+}
+
+func xssBait(w http.ResponseWriter, r *http.Request) string {
+	msg := r.URL.Query().Get("msg")
+	fmt.Fprintf(w, "<p>%s</p>", msg)
+	return fmt.Sprintf("XSS comment: %s", msg)
+}
+
+func fakeAdmin(w http.ResponseWriter, r *http.Request) string {
+	if r.Method == "POST" {
+		r.ParseForm()
+		u := r.FormValue("user")
+		p := r.FormValue("pass")
+		fmt.Fprintln(w, "Access Denied.")
+		return fmt.Sprintf("Admin login attempt: %s / %s", u, p)
+	}
+	fmt.Fprintln(w, "<form method='POST'>User: <input name='user'/><br/>Pass: <input name='pass' type='password'/><br/><input type='submit'/></form>")
+	return "Admin login form served"
+}
+
+func fakeUpload(w http.ResponseWriter, r *http.Request) string {
+	if r.Method == "POST" {
+		r.ParseMultipartForm(10 << 20)
+		file, handler, err := r.FormFile("upload")
+		if err == nil {
+			file.Close()
+			fmt.Fprintln(w, "File received.")
+			return fmt.Sprintf("File uploaded: %s (%d bytes)", handler.Filename, handler.Size)
+		}
+		fmt.Fprintln(w, "Upload failed.")
+		return "Upload error"
+	}
+	fmt.Fprintln(w, "<form method='POST' enctype='multipart/form-data'>File: <input type='file' name='upload'/><br/><input type='submit'/></form>")
+	return "Upload form served"
+}
+
+func leakConfig(w http.ResponseWriter, r *http.Request) string {
+	fmt.Fprintln(w, "DB_PASS=supersecret\nAPI_KEY=12345-ABCDE")
+	return "Config file accessed"
+}
+
+func serveRobots(w http.ResponseWriter, r *http.Request) string {
+	fmt.Fprintln(w, "User-agent: *\nDisallow: /backup\nDisallow: /admin")
+	return "robots.txt requested"
+}
+
+func fakeDownload(w http.ResponseWriter, r *http.Request) string {
+	w.Header().Set("Content-Disposition", "attachment; filename=backup.zip")
+	w.Write([]byte("FAKE_ZIP_CONTENT"))
+	return "Backup.zip requested"
+}
+
+func fakeShell(w http.ResponseWriter, r *http.Request) string {
+	cmd := r.URL.Query().Get("cmd")
+	fmt.Fprintf(w, "Output: %s", strings.Repeat("*", len(cmd)))
+	return fmt.Sprintf("Web shell command: %s", cmd)
 }
