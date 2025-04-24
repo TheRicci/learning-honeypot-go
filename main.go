@@ -2,48 +2,120 @@ package main
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net"
+	"os"
 	"strings"
 	"sync"
 	"time"
 )
 
-type Event struct {
+type SuricataAlert struct {
+	UID       string
+	Signature string
+	Category  string
+	Severity  int
+	SrcIP     string
+	DestPort  int
 	Timestamp time.Time
-	IP        string
-	Port      int
-	Payload   string
-	Session   []string
-	Duration  time.Duration
+}
+
+type Event struct {
+	Timestamp    time.Time
+	IP           string
+	Port         int
+	Payload      string
+	Session      []string
+	Duration     time.Duration
+	SessionID    string
+	SuricataData []SuricataAlert
+	ThreatScore  int
+	Suricata     *SuricataAlert
 }
 
 type Honeypot struct {
-	ports    []int
-	events   chan Event
-	logMutex sync.RWMutex
-	ipLog    map[string]int
-	history  []Event
+	ports          []int
+	events         chan Event
+	eventMutex     sync.RWMutex
+	ipLog          map[string]int
+	suricataAlerts chan SuricataAlert
+	suricataMap    map[string][]SuricataAlert
+	history        []Event
 }
 
 func NewHoneypot(ports []int) *Honeypot {
 	return &Honeypot{
-		ports:   ports,
-		events:  make(chan Event, 100),
-		ipLog:   make(map[string]int),
-		history: []Event{},
+		ports:          ports,
+		events:         make(chan Event, 100),
+		ipLog:          make(map[string]int),
+		suricataAlerts: make(chan SuricataAlert, 100),
+		suricataMap:    make(map[string][]SuricataAlert),
+		history:        []Event{},
 	}
 }
 
-func (hp *Honeypot) Start() {
-	for _, port := range hp.ports {
-		if port == 21 {
-			go hp.listenFTP(port)
-		} else {
-			go hp.listenOnPort(port)
-		}
+func (hp *Honeypot) watchSuricataAlerts(filePath string) {
+	file, err := os.Open(filePath)
+	if err != nil {
+		fmt.Println("[!] Failed to open Suricata log file:", err)
+		return
 	}
-	go hp.eventLogger()
+
+	reader := bufio.NewReader(file)
+	seen := make(map[string]bool)
+
+	for {
+		line, err := reader.ReadBytes('\n')
+		if err != nil {
+			if err == io.EOF {
+				time.Sleep(1 * time.Second)
+				continue
+			}
+			fmt.Println("[!] Error reading Suricata log:", err)
+			break
+		}
+
+		var entry map[string]interface{}
+		if err := json.Unmarshal(line, &entry); err != nil {
+			fmt.Println("[!] JSON parse error:", err)
+			continue
+		}
+
+		if entry["event_type"] != "alert" {
+			continue
+		}
+
+		srcIP := entry["src_ip"].(string)
+		destPort := int(entry["dest_port"].(float64))
+		alertData := entry["alert"].(map[string]interface{})
+		signature := alertData["signature"].(string)
+		category := alertData["category"].(string)
+		severity := int(alertData["severity"].(float64))
+		timestampStr := entry["timestamp"].(string)
+
+		uid := fmt.Sprintf("%s:%d:%s", srcIP, destPort, signature)
+		if seen[uid] {
+			continue
+		}
+		seen[uid] = true
+
+		t, _ := time.Parse("2006-01-02T15:04:05.999999-0700", timestampStr)
+
+		alert := SuricataAlert{
+			UID:       uid,
+			Signature: signature,
+			Category:  category,
+			Severity:  severity,
+			SrcIP:     srcIP,
+			DestPort:  destPort,
+			Timestamp: t,
+		}
+
+		hp.suricataAlerts <- alert
+	}
+
 }
 
 func (hp *Honeypot) listenOnPort(port int) {
@@ -63,7 +135,7 @@ func (hp *Honeypot) listenOnPort(port int) {
 	}
 }
 
-func (hp *Honeypot) handleConnection(conn net.Conn, port int) {
+func (hp *Honeypot) handleConnection(conn net.Conn, port int) { //add start and duration
 	defer conn.Close()
 	remoteAddr := conn.RemoteAddr().String()
 	ip, _, _ := net.SplitHostPort(remoteAddr)
@@ -130,25 +202,58 @@ func (hp *Honeypot) handleFTPSession(conn net.Conn, port int) {
 	}
 }
 
-func (hp *Honeypot) eventLogger() {
+func (hp *Honeypot) eventsAlertsController() {
 	for {
 		select {
 		case evt := <-hp.events:
-			hp.logMutex.Lock()
-			hp.ipLog[evt.IP]++
-			hp.history = append(hp.history, evt)
-			hp.logMutex.Unlock()
-
-			fmt.Printf("[LOG] %s - %s:%d > %s\n",
-				evt.Timestamp.Format(time.RFC3339), evt.IP, evt.Port, evt.Payload)
+			fmt.Printf("[LOG] %s - %s:%d > %s\n", evt.Timestamp.Format(time.RFC3339), evt.IP, evt.Port, evt.Payload)
 			if len(evt.Session) > 0 {
 				fmt.Printf("[SESSION from %s] Duration: %s\n", evt.IP, evt.Duration)
 				for _, cmd := range evt.Session {
 					fmt.Printf("\t> %s\n", cmd)
 				}
 			}
+
+			start := evt.Timestamp
+			end := evt.Timestamp.Add(evt.Duration)
+			for _, alert := range hp.suricataMap[evt.IP] {
+				if alert.DestPort == evt.Port &&
+					alert.Timestamp.After(start) && alert.Timestamp.Before(end) {
+					evt.Suricata = &alert
+					break
+				}
+			}
+
+			hp.eventMutex.Lock()
+			hp.history = append(hp.history, evt)
+			hp.eventMutex.Unlock()
+
+		case alert := <-hp.suricataAlerts:
+			fmt.Printf("[SURICATA] [%s] %s:%d -> %s (%s, Severity %d)\n",
+				alert.Timestamp.Format(time.RFC3339),
+				alert.SrcIP,
+				alert.DestPort,
+				alert.Signature,
+				alert.Category,
+				alert.Severity,
+			)
+
+			hp.suricataMap[alert.SrcIP] = append(hp.suricataMap[alert.SrcIP], alert)
+
 		}
 	}
+}
+
+func (hp *Honeypot) Start() {
+	for _, port := range hp.ports {
+		if port == 21 {
+			go hp.listenFTP(port)
+		} else {
+			go hp.listenOnPort(port)
+		}
+	}
+	go hp.eventsAlertsController()
+	go hp.watchSuricataAlerts("/var/log/suricata/eve.json")
 }
 
 func main() {
