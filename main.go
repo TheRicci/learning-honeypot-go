@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -159,14 +160,14 @@ func (hp *Honeypot) handleConnection(conn net.Conn, port int) { //add start and 
 	}
 }
 
-func (hp *Honeypot) listenFTP(port int) {
+func (hp *Honeypot) listenFTPS(port int) {
 	addr := fmt.Sprintf(":%d", port)
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
-		fmt.Printf("[!] Error listening on FTP port %d: %v\n", port, err)
+		fmt.Printf("[!] Error listening on FTPS port %d: %v\n", port, err)
 		return
 	}
-	fmt.Printf("[*] FTP honeypot listening on port %d\n", port)
+	fmt.Printf("[*] FTPS honeypot listening on port %d\n", port)
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -178,23 +179,43 @@ func (hp *Honeypot) listenFTP(port int) {
 
 func (hp *Honeypot) handleFTPSession(conn net.Conn, port int) {
 	defer conn.Close()
-	remoteAddr := conn.RemoteAddr().String()
+
+	// Load TLS certificate
+	tlsCert, err := tls.LoadX509KeyPair("cert.pem", "key.pem")
+	if err != nil {
+		fmt.Println("[!] Failed to load TLS certificate:", err)
+		return
+	}
+
+	// Wrap the connection with TLS
+	tlsConn := tls.Server(conn, &tls.Config{
+		Certificates: []tls.Certificate{tlsCert},
+	})
+	err = tlsConn.Handshake()
+	if err != nil {
+		fmt.Println("[!] TLS handshake failed:", err)
+		return
+	}
+	defer tlsConn.Close()
+
+	// Extract IP
+	remoteAddr := tlsConn.RemoteAddr().String()
 	ip, _, _ := net.SplitHostPort(remoteAddr)
 
 	start := time.Now()
 	session := []string{}
 
-	conn.Write([]byte("220 Welcome to MyFTP Server\r\n"))
-	scanner := bufio.NewScanner(conn)
+	tlsConn.Write([]byte("220 FTPS Service Ready\r\n"))
+	scanner := bufio.NewScanner(tlsConn)
 	for scanner.Scan() {
 		line := scanner.Text()
 		session = append(session, line)
 
 		if strings.ToUpper(line) == "QUIT" {
-			conn.Write([]byte("221 Goodbye.\r\n"))
+			tlsConn.Write([]byte("221 Goodbye.\r\n"))
 			break
 		} else {
-			conn.Write([]byte("500 Unknown command.\r\n"))
+			tlsConn.Write([]byte("500 Unknown command.\r\n"))
 		}
 	}
 	duration := time.Since(start)
@@ -259,9 +280,9 @@ func (hp *Honeypot) eventsAlertsController() {
 func (hp *Honeypot) Start() {
 	for _, port := range hp.ports {
 		switch port {
-		case 21:
-			go hp.listenFTP(port)
-		case 80:
+		case 990:
+			go hp.listenFTPS(port)
+		case 443:
 			go hp.startHTTPHoneypot(port)
 		default:
 			go hp.listenOnPort(port)
@@ -272,7 +293,7 @@ func (hp *Honeypot) Start() {
 }
 
 func main() {
-	hp := NewHoneypot([]int{21, 22, 80})
+	hp := NewHoneypot([]int{443, 22, 990})
 	hp.Start()
 
 	select {} // Block forever
@@ -305,8 +326,14 @@ func (hp *Honeypot) startHTTPHoneypot(port int) {
 	mux.HandleFunc("/shell.php", wrap(fakeShell))
 
 	addr := fmt.Sprintf(":%d", port)
+
+	certFile := "cert.pem"
+	keyFile := "key.pem"
+	err := http.ListenAndServeTLS(addr, certFile, keyFile, mux)
+	if err != nil {
+		fmt.Printf("[!] HTTPS server error: %v\n", err)
+	}
 	fmt.Println("[*] HTTP honeypot running on", addr)
-	http.ListenAndServe(addr, mux)
 }
 
 func fakeLogin(w http.ResponseWriter, r *http.Request) string {
