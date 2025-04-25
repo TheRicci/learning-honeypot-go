@@ -8,9 +8,15 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/google/gopacket"
+	"github.com/google/gopacket/layers"
+	"github.com/google/gopacket/pcapgo"
 )
 
 type SuricataAlert struct {
@@ -197,7 +203,6 @@ func (hp *Honeypot) handleFTPSession(conn net.Conn, port int) {
 		Timestamp: start,
 		IP:        ip,
 		Port:      port,
-		Payload:   "FTP session",
 		Session:   session,
 		Duration:  duration,
 	}
@@ -233,6 +238,7 @@ func (hp *Honeypot) eventsAlertsController() {
 			hp.eventMutex.Lock()
 			hp.history = append(hp.history, evt)
 			hp.eventMutex.Unlock()
+			hp.GeneratePCAPAndRunSuricata(evt)
 
 		case alert := <-hp.suricataAlerts:
 			fmt.Printf("[SURICATA] [%s] %s:%d -> %s (%s, Severity %d)\n",
@@ -375,4 +381,92 @@ func fakeShell(w http.ResponseWriter, r *http.Request) string {
 	cmd := r.URL.Query().Get("cmd")
 	fmt.Fprintf(w, "Output: %s", strings.Repeat("*", len(cmd)))
 	return fmt.Sprintf("Web shell command: %s", cmd)
+}
+
+func (hp *Honeypot) GeneratePCAPAndRunSuricata(evt Event) error {
+	filename := fmt.Sprintf("%s_%d_%d.pcap", evt.IP, evt.Port, time.Now().UnixNano())
+	pcapPath := filepath.Join("/tmp/pcaps", filename)
+
+	err := WritePCAP(evt, pcapPath)
+	if err != nil {
+		return fmt.Errorf("error writing fake pcap: %v", err)
+	}
+
+	cmd := exec.Command("suricata", "-r", pcapPath, "-l", "/tmp/suricata-out")
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	fmt.Printf("[SURICATA] Running analysis on %s...\n", pcapPath)
+	err = cmd.Run()
+	if err != nil {
+		return fmt.Errorf("suricata execution failed: %v", err)
+	}
+
+	return nil
+}
+
+func WritePCAP(evt Event, filepath string) error {
+	f, err := os.Create(filepath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	writer := pcapgo.NewWriter(f)
+	writer.WriteFileHeader(65536, layers.LinkTypeEthernet)
+
+	srcIP := net.ParseIP(evt.IP)
+	if srcIP == nil {
+		srcIP = net.IPv4(192, 168, 1, 100) // default fallback
+	}
+	dstIP := net.IPv4(192, 168, 1, 10)
+
+	srcPort := layers.TCPPort(12345)
+	dstPort := layers.TCPPort(evt.Port)
+
+	payload := []byte(evt.Payload)
+	if len(evt.Session) > 0 {
+		payload = []byte(strings.Join(evt.Session, "\r\n"))
+	}
+
+	eth := &layers.Ethernet{
+		SrcMAC:       []byte{0x00, 0x11, 0x22, 0x33, 0x44, 0x55},
+		DstMAC:       []byte{0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff},
+		EthernetType: layers.EthernetTypeIPv4,
+	}
+	ip := &layers.IPv4{
+		Version:  4,
+		SrcIP:    srcIP,
+		DstIP:    dstIP,
+		TTL:      64,
+		Protocol: layers.IPProtocolTCP,
+	}
+	tcp := &layers.TCP{
+		SrcPort: srcPort,
+		DstPort: dstPort,
+		Seq:     1105024978,
+		SYN:     true,
+		ACK:     true,
+		Window:  14600,
+	}
+	tcp.SetNetworkLayerForChecksum(ip)
+
+	buffer := gopacket.NewSerializeBuffer()
+	opts := gopacket.SerializeOptions{FixLengths: true, ComputeChecksums: true}
+	err = gopacket.SerializeLayers(buffer, opts,
+		eth,
+		ip,
+		tcp,
+		gopacket.Payload(payload),
+	)
+	if err != nil {
+		return err
+	}
+
+	captureInfo := gopacket.CaptureInfo{
+		Timestamp:     evt.Timestamp,
+		CaptureLength: len(buffer.Bytes()),
+		Length:        len(buffer.Bytes()),
+	}
+	return writer.WritePacket(captureInfo, buffer.Bytes())
 }
