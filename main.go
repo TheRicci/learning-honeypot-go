@@ -5,7 +5,10 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"io"
+	"math/rand"
+
 	"net"
 	"net/http"
 	"os"
@@ -15,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/fsnotify/fsnotify"
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 	"github.com/google/gopacket/pcapgo"
@@ -28,72 +32,103 @@ type SuricataAlert struct {
 	SrcIP     string
 	DestPort  int
 	Timestamp time.Time
+	EventID   string
 }
 
 type Event struct {
+	ID           string
 	Timestamp    time.Time
 	IP           string
 	Port         int
 	Payload      string
 	Session      []string
 	Duration     time.Duration
-	SessionID    string
-	SuricataData []SuricataAlert
-	ThreatScore  int
-	Suricata     *SuricataAlert
+	SuricataData []*SuricataAlert
 }
 
 type Honeypot struct {
-	ports          []int
-	events         chan Event
-	eventMutex     sync.RWMutex
-	ipLog          map[string]int
-	suricataAlerts chan SuricataAlert
-	suricataMap    map[string][]SuricataAlert
-	history        []Event
+	ports      []int
+	EventMap   map[string]*Event
+	eventMutex sync.RWMutex
+	history    []*Event
 }
 
 func NewHoneypot(ports []int) *Honeypot {
 	return &Honeypot{
-		ports:          ports,
-		events:         make(chan Event, 100),
-		ipLog:          make(map[string]int),
-		suricataAlerts: make(chan SuricataAlert, 100),
-		suricataMap:    make(map[string][]SuricataAlert),
-		history:        []Event{},
+		ports:    ports,
+		EventMap: make(map[string]*Event),
+		history:  []*Event{},
 	}
 }
 
-func (hp *Honeypot) watchSuricataAlerts(filePath string) {
-	file, err := os.Open(filePath)
+func (hp *Honeypot) watchSuricataAlerts() {
+	const baseDir = "/tmp/suricata-alerts"
+
+	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
-		fmt.Println("[!] Failed to open Suricata log file:", err)
+		fmt.Println("[!] Failed to create fsnotify watcher:", err)
+		return
+	}
+	defer watcher.Close()
+
+	if err := watcher.Add(baseDir); err != nil {
+		fmt.Println("[!] Error watching directory:", err)
 		return
 	}
 
-	reader := bufio.NewReader(file)
 	seen := make(map[string]bool)
+
+	for {
+		select {
+		case ev := <-watcher.Events:
+			if ev.Op&fsnotify.Create == fsnotify.Create {
+				name := filepath.Base(ev.Name)
+				if strings.HasPrefix(name, "event-") {
+					evtID := strings.TrimPrefix(name, "event-")
+					if !seen[evtID] {
+						subDir := filepath.Join(baseDir, name)
+						evePath := filepath.Join(subDir, "eve.json")
+						go hp.processEveFile(evtID, evePath)
+						seen[evtID] = true
+					}
+				}
+			}
+
+		case err := <-watcher.Errors:
+			fmt.Println("[!] fsnotify error:", err)
+		}
+	}
+}
+
+func (hp *Honeypot) processEveFile(evtID, evePath string) {
+	file, err := os.Open(evePath)
+	if err != nil {
+		return
+	}
+	defer file.Close()
+
+	reader := bufio.NewReader(file)
 
 	for {
 		line, err := reader.ReadBytes('\n')
 		if err != nil {
 			if err == io.EOF {
-				time.Sleep(1 * time.Second)
-				continue
+				break
 			}
-			fmt.Println("[!] Error reading Suricata log:", err)
+			fmt.Println("[!] Error reading eve.json:", err)
 			break
 		}
 
 		var entry map[string]interface{}
 		if err := json.Unmarshal(line, &entry); err != nil {
-			fmt.Println("[!] JSON parse error:", err)
 			continue
 		}
 
-		if entry["event_type"] != "alert" {
-			continue
-		}
+		/*
+			if entry["event_type"] != "alert" {
+				continue
+			}
+		*/
 
 		srcIP := entry["src_ip"].(string)
 		destPort := int(entry["dest_port"].(float64))
@@ -103,27 +138,32 @@ func (hp *Honeypot) watchSuricataAlerts(filePath string) {
 		severity := int(alertData["severity"].(float64))
 		timestampStr := entry["timestamp"].(string)
 
-		uid := fmt.Sprintf("%s:%d:%s", srcIP, destPort, signature)
-		if seen[uid] {
-			continue
-		}
-		seen[uid] = true
-
-		t, _ := time.Parse("2006-01-02T15:04:05.999999-0700", timestampStr)
+		t, _ := time.Parse(time.RFC3339Nano, timestampStr)
 
 		alert := SuricataAlert{
-			UID:       uid,
 			Signature: signature,
 			Category:  category,
 			Severity:  severity,
 			SrcIP:     srcIP,
 			DestPort:  destPort,
 			Timestamp: t,
+			EventID:   evtID,
 		}
 
-		hp.suricataAlerts <- alert
-	}
+		fmt.Printf("[SURICATA] [EVENT-%s] [%s] %s:%d -> %s (%s, Severity %d)\n",
+			alert.EventID,
+			alert.Timestamp.Format(time.RFC3339),
+			alert.SrcIP,
+			alert.DestPort,
+			alert.Signature,
+			alert.Category,
+			alert.Severity,
+		)
 
+		hp.eventMutex.Lock()
+		hp.EventMap[evtID].SuricataData = append(hp.EventMap[evtID].SuricataData, &alert)
+		hp.eventMutex.Unlock()
+	}
 }
 
 func (hp *Honeypot) listenOnPort(port int) {
@@ -152,12 +192,44 @@ func (hp *Honeypot) handleConnection(conn net.Conn, port int) { //add start and 
 	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	data, _ := reader.ReadString('\n')
 
-	hp.events <- Event{
-		Timestamp: time.Now(),
+	hp.registerEvent(time.Now(), ip, &data, port, nil)
+}
+
+type ftpData struct {
+	session  []string
+	duration time.Duration
+}
+
+func (hp *Honeypot) registerEvent(t time.Time, ip string, payload *string, port int, ftp *ftpData) {
+	id := makeEventID(ip, port, t)
+
+	event := Event{
+		ID:        id,
+		Timestamp: t,
 		IP:        ip,
 		Port:      port,
-		Payload:   data,
 	}
+
+	if ftp != nil {
+		event.Session = ftp.session
+		event.Duration = ftp.duration
+	} else {
+		event.Payload = *payload
+	}
+
+	hp.eventMutex.Lock()
+	hp.EventMap[id] = &event
+	hp.eventMutex.Unlock()
+
+	fmt.Printf("[LOG] %s - %s:%d > %s\n", event.Timestamp.Format(time.RFC3339), event.IP, event.Port, event.Payload)
+	if len(event.Session) > 0 {
+		fmt.Printf("[SESSION from %s] Duration: %s\n", event.IP, event.Duration)
+		for _, cmd := range event.Session {
+			fmt.Printf("\t> %s\n", cmd)
+		}
+	}
+
+	hp.GeneratePCAPAndRunSuricata(event)
 }
 
 func (hp *Honeypot) listenFTPS(port int) {
@@ -220,61 +292,8 @@ func (hp *Honeypot) handleFTPSession(conn net.Conn, port int) {
 	}
 	duration := time.Since(start)
 
-	hp.events <- Event{
-		Timestamp: start,
-		IP:        ip,
-		Port:      port,
-		Session:   session,
-		Duration:  duration,
-	}
-}
+	hp.registerEvent(start, ip, nil, port, &ftpData{duration: duration, session: session})
 
-func (hp *Honeypot) eventsAlertsController() {
-	for {
-		select {
-		case evt := <-hp.events:
-			fmt.Printf("[LOG] %s - %s:%d > %s\n", evt.Timestamp.Format(time.RFC3339), evt.IP, evt.Port, evt.Payload)
-			if len(evt.Session) > 0 {
-				fmt.Printf("[SESSION from %s] Duration: %s\n", evt.IP, evt.Duration)
-				for _, cmd := range evt.Session {
-					fmt.Printf("\t> %s\n", cmd)
-				}
-			}
-
-			alerts := hp.suricataMap[fmt.Sprintf("%s_%d", evt.IP, evt.Port)]
-			for _, alert := range alerts {
-				if evt.Port == 21 { // FTP
-					if alert.Timestamp.After(evt.Timestamp) && alert.Timestamp.Before(evt.Timestamp.Add(evt.Duration)) {
-						evt.Suricata = &alert
-						break
-					}
-				} else { // HTTP or others
-					if alert.Timestamp.After(evt.Timestamp.Add(-1*time.Second)) && alert.Timestamp.Before(evt.Timestamp.Add(3*time.Second)) {
-						evt.Suricata = &alert
-						break
-					}
-				}
-			}
-
-			hp.eventMutex.Lock()
-			hp.history = append(hp.history, evt)
-			hp.eventMutex.Unlock()
-			hp.GeneratePCAPAndRunSuricata(evt)
-
-		case alert := <-hp.suricataAlerts:
-			fmt.Printf("[SURICATA] [%s] %s:%d -> %s (%s, Severity %d)\n",
-				alert.Timestamp.Format(time.RFC3339),
-				alert.SrcIP,
-				alert.DestPort,
-				alert.Signature,
-				alert.Category,
-				alert.Severity,
-			)
-
-			hp.suricataMap[fmt.Sprintf("%s_%d", alert.SrcIP, alert.DestPort)] = append(hp.suricataMap[fmt.Sprintf("%s_%d", alert.SrcIP, alert.DestPort)], alert)
-
-		}
-	}
 }
 
 func (hp *Honeypot) Start() {
@@ -288,8 +307,7 @@ func (hp *Honeypot) Start() {
 			go hp.listenOnPort(port)
 		}
 	}
-	go hp.eventsAlertsController()
-	go hp.watchSuricataAlerts("/var/log/suricata/eve.json")
+	go hp.watchSuricataAlerts()
 }
 
 func main() {
@@ -306,19 +324,14 @@ func (hp *Honeypot) startHTTPHoneypot(port int) {
 		return func(w http.ResponseWriter, r *http.Request) {
 			info := handler(w, r)
 			ip := strings.Split(r.RemoteAddr, ":")[0]
-			hp.events <- Event{
-				Timestamp: time.Now(),
-				IP:        ip,
-				Port:      port,
-				Payload:   fmt.Sprintf("%s %s > %s", r.Method, r.URL.Path, info),
-			}
+
+			hp.registerEvent(time.Now(), ip, &info, port, nil)
 		}
 	}
 
-	mux.HandleFunc("/login", wrap(fakeLogin))
 	mux.HandleFunc("/search", wrap(sqlInjectionBait))
 	mux.HandleFunc("/comment", wrap(xssBait))
-	mux.HandleFunc("/admin", wrap(fakeAdmin))
+	mux.HandleFunc("/admin.php", wrap(fakePHPAdmin))
 	mux.HandleFunc("/upload", wrap(fakeUpload))
 	mux.HandleFunc("/config", wrap(leakConfig))
 	mux.HandleFunc("/robots.txt", wrap(serveRobots))
@@ -336,18 +349,6 @@ func (hp *Honeypot) startHTTPHoneypot(port int) {
 	fmt.Println("[*] HTTP honeypot running on", addr)
 }
 
-func fakeLogin(w http.ResponseWriter, r *http.Request) string {
-	if r.Method == "POST" {
-		r.ParseForm()
-		username := r.FormValue("username")
-		password := r.FormValue("password")
-		fmt.Fprintln(w, "Login failed.")
-		return fmt.Sprintf("Login attempt: %s / %s", username, password)
-	}
-	fmt.Fprintln(w, "<form method='POST'>Username: <input name='username'/><br/>Password: <input name='password' type='password'/><br/><input type='submit'/></form>")
-	return "Login form served"
-}
-
 func sqlInjectionBait(w http.ResponseWriter, r *http.Request) string {
 	q := r.URL.Query().Get("q")
 	fmt.Fprintf(w, "Results for '%s': No results found.", q)
@@ -360,16 +361,28 @@ func xssBait(w http.ResponseWriter, r *http.Request) string {
 	return fmt.Sprintf("XSS comment: %s", msg)
 }
 
-func fakeAdmin(w http.ResponseWriter, r *http.Request) string {
+func fakePHPAdmin(w http.ResponseWriter, r *http.Request) string {
 	if r.Method == "POST" {
 		r.ParseForm()
 		u := r.FormValue("user")
 		p := r.FormValue("pass")
 		fmt.Fprintln(w, "Access Denied.")
-		return fmt.Sprintf("Admin login attempt: %s / %s", u, p)
+		return fmt.Sprintf("Admin.php login attempt: %s / %s", u, p)
 	}
-	fmt.Fprintln(w, "<form method='POST'>User: <input name='user'/><br/>Pass: <input name='pass' type='password'/><br/><input type='submit'/></form>")
-	return "Admin login form served"
+	fmt.Fprintln(w, `
+		<!DOCTYPE html>
+		<html>
+		<head><title>Admin Login</title></head>
+		<body>
+			<h2>Admin Panel</h2>
+			<form method='POST' action='admin.php'>
+				User: <input name='user'/><br/>
+				Pass: <input name='pass' type='password'/><br/>
+				<input type='submit'/>
+			</form>
+		</body>
+		</html>`)
+	return "Admin.php login form served"
 }
 
 func fakeUpload(w http.ResponseWriter, r *http.Request) string {
@@ -411,7 +424,7 @@ func fakeShell(w http.ResponseWriter, r *http.Request) string {
 }
 
 func (hp *Honeypot) GeneratePCAPAndRunSuricata(evt Event) error {
-	filename := fmt.Sprintf("%s_%d_%d.pcap", evt.IP, evt.Port, time.Now().UnixNano())
+	filename := fmt.Sprintf("%s.pcap", evt.ID)
 	pcapPath := filepath.Join("/tmp/pcaps", filename)
 
 	err := WritePCAP(evt, pcapPath)
@@ -419,7 +432,7 @@ func (hp *Honeypot) GeneratePCAPAndRunSuricata(evt Event) error {
 		return fmt.Errorf("error writing fake pcap: %v", err)
 	}
 
-	cmd := exec.Command("suricata", "-r", pcapPath, "-l", "/tmp/suricata-out")
+	cmd := exec.Command("suricata", "-r", pcapPath, "-l", fmt.Sprintf("/tmp/suricata-alerts/event-%s", evt.ID))
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
@@ -442,58 +455,79 @@ func WritePCAP(evt Event, filepath string) error {
 	writer := pcapgo.NewWriter(f)
 	writer.WriteFileHeader(65536, layers.LinkTypeEthernet)
 
+	// Prepare addressing
 	srcIP := net.ParseIP(evt.IP)
 	if srcIP == nil {
-		srcIP = net.IPv4(192, 168, 1, 100) // default fallback
+		srcIP = net.IPv4(192, 168, 1, 100)
 	}
 	dstIP := net.IPv4(192, 168, 1, 10)
-
 	srcPort := layers.TCPPort(12345)
 	dstPort := layers.TCPPort(evt.Port)
 
-	payload := []byte(evt.Payload)
+	// Build the full payload
+	raw := evt.Payload
 	if len(evt.Session) > 0 {
-		payload = []byte(strings.Join(evt.Session, "\r\n"))
+		raw = strings.Join(evt.Session, "\r\n")
 	}
 
-	eth := &layers.Ethernet{
-		SrcMAC:       []byte{0x00, 0x11, 0x22, 0x33, 0x44, 0x55},
-		DstMAC:       []byte{0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff},
-		EthernetType: layers.EthernetTypeIPv4,
-	}
-	ip := &layers.IPv4{
-		Version:  4,
-		SrcIP:    srcIP,
-		DstIP:    dstIP,
-		TTL:      64,
-		Protocol: layers.IPProtocolTCP,
-	}
-	tcp := &layers.TCP{
-		SrcPort: srcPort,
-		DstPort: dstPort,
-		Seq:     1105024978,
-		SYN:     true,
-		ACK:     true,
-		Window:  14600,
-	}
-	tcp.SetNetworkLayerForChecksum(ip)
+	data := []byte(raw)
+	const safeSize = 1400 // ~MTU minus headers
 
-	buffer := gopacket.NewSerializeBuffer()
-	opts := gopacket.SerializeOptions{FixLengths: true, ComputeChecksums: true}
-	err = gopacket.SerializeLayers(buffer, opts,
-		eth,
-		ip,
-		tcp,
-		gopacket.Payload(payload),
-	)
-	if err != nil {
-		return err
+	// Split into chunks and write each as its own packet (no EVENT-ID marker)
+	for offset := 0; offset < len(data); {
+		end := offset + safeSize
+		if end > len(data) {
+			end = len(data)
+		}
+		chunk := data[offset:end]
+
+		eth := &layers.Ethernet{
+			SrcMAC:       []byte{0x00, 0x11, 0x22, 0x33, 0x44, 0x55},
+			DstMAC:       []byte{0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff},
+			EthernetType: layers.EthernetTypeIPv4,
+		}
+		ip := &layers.IPv4{
+			Version:  4,
+			SrcIP:    srcIP,
+			DstIP:    dstIP,
+			TTL:      64,
+			Protocol: layers.IPProtocolTCP,
+		}
+		tcp := &layers.TCP{
+			SrcPort: srcPort,
+			DstPort: dstPort,
+			Seq:     1105024978,
+			SYN:     true,
+			ACK:     true,
+			Window:  14600,
+		}
+		tcp.SetNetworkLayerForChecksum(ip)
+
+		buf := gopacket.NewSerializeBuffer()
+		opts := gopacket.SerializeOptions{FixLengths: true, ComputeChecksums: true}
+		if err := gopacket.SerializeLayers(buf, opts, eth, ip, tcp, gopacket.Payload(chunk)); err != nil {
+			return err
+		}
+
+		ci := gopacket.CaptureInfo{
+			Timestamp:     evt.Timestamp,
+			CaptureLength: len(buf.Bytes()),
+			Length:        len(buf.Bytes()),
+		}
+		if err := writer.WritePacket(ci, buf.Bytes()); err != nil {
+			return err
+		}
+
+		offset = end
 	}
 
-	captureInfo := gopacket.CaptureInfo{
-		Timestamp:     evt.Timestamp,
-		CaptureLength: len(buffer.Bytes()),
-		Length:        len(buffer.Bytes()),
-	}
-	return writer.WritePacket(captureInfo, buffer.Bytes())
+	return nil
+}
+
+func makeEventID(ip string, port int, t time.Time) string {
+	randVal := rand.Intn(1000000) + 1
+	seed := fmt.Sprintf("%s|%d|%d|%d", ip, port, t.UnixNano(), randVal)
+	h := fnv.New64a()
+	h.Write([]byte(seed))
+	return fmt.Sprintf("%x", h.Sum64())
 }
