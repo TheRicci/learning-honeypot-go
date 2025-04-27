@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -47,18 +49,24 @@ type Event struct {
 }
 
 type Honeypot struct {
-	ports      []int
-	EventMap   map[string]*Event
-	eventMutex sync.RWMutex
-	history    []*Event
+	ports        []int
+	EventMap     map[string]*Event
+	eventMutex   sync.RWMutex
+	history      []*Event
+	suricataJobs chan *Event
+	splunkJobs   chan *Event
 }
 
 func NewHoneypot(ports []int) *Honeypot {
-	return &Honeypot{
-		ports:    ports,
-		EventMap: make(map[string]*Event),
-		history:  []*Event{},
+	hp := &Honeypot{
+		ports:        ports,
+		EventMap:     make(map[string]*Event),
+		history:      []*Event{},
+		suricataJobs: make(chan *Event, 100),
+		splunkJobs:   make(chan *Event, 100),
 	}
+	hp.startWorkerPools()
+	return hp
 }
 
 func (hp *Honeypot) watchSuricataAlerts() {
@@ -162,7 +170,9 @@ func (hp *Honeypot) processEveFile(evtID, evePath string) {
 
 		hp.eventMutex.Lock()
 		hp.EventMap[evtID].SuricataData = append(hp.EventMap[evtID].SuricataData, &alert)
+		evt := hp.EventMap[evtID]
 		hp.eventMutex.Unlock()
+		hp.splunkJobs <- evt
 	}
 }
 
@@ -229,7 +239,7 @@ func (hp *Honeypot) registerEvent(t time.Time, ip string, payload *string, port 
 		}
 	}
 
-	hp.GeneratePCAPAndRunSuricata(event)
+	hp.suricataJobs <- &event
 }
 
 func (hp *Honeypot) listenFTPS(port int) {
@@ -311,10 +321,13 @@ func (hp *Honeypot) Start() {
 }
 
 func main() {
-	hp := NewHoneypot([]int{443, 22, 990})
+	hp := NewHoneypot([]int{443, 990, 22})
 	hp.Start()
 
-	select {} // Block forever
+	sigint := make(chan os.Signal, 1)
+	signal.Notify(sigint, os.Interrupt)
+	<-sigint
+	fmt.Println("Shutting down server...")
 }
 
 func (hp *Honeypot) startHTTPHoneypot(port int) {
@@ -423,7 +436,7 @@ func fakeShell(w http.ResponseWriter, r *http.Request) string {
 	return fmt.Sprintf("Web shell command: %s", cmd)
 }
 
-func (hp *Honeypot) GeneratePCAPAndRunSuricata(evt Event) error {
+func (hp *Honeypot) GeneratePCAPAndRunSuricata(evt *Event) error {
 	filename := fmt.Sprintf("%s.pcap", evt.ID)
 	pcapPath := filepath.Join("/tmp/pcaps", filename)
 
@@ -445,7 +458,7 @@ func (hp *Honeypot) GeneratePCAPAndRunSuricata(evt Event) error {
 	return nil
 }
 
-func WritePCAP(evt Event, filepath string) error {
+func WritePCAP(evt *Event, filepath string) error {
 	f, err := os.Create(filepath)
 	if err != nil {
 		return err
@@ -530,4 +543,67 @@ func makeEventID(ip string, port int, t time.Time) string {
 	h := fnv.New64a()
 	h.Write([]byte(seed))
 	return fmt.Sprintf("%x", h.Sum64())
+}
+
+var hecURL = "https://splunk.example.com:8088/services/collector/event"
+var hecToken = "YOUR-HEC-TOKEN"
+
+type hecEvent struct {
+	Time       int64       `json:"time"`
+	Sourcetype string      `json:"sourcetype"`
+	Event      interface{} `json:"event"`
+}
+
+func sendToSplunk(evt *Event) error {
+	payload := hecEvent{
+		Time:       evt.Timestamp.Unix(),
+		Sourcetype: "honeypot:event",
+		Event:      evt,
+	}
+	data, _ := json.Marshal(payload)
+
+	req, err := http.NewRequest("POST", hecURL, bytes.NewReader(data))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Splunk "+hecToken)
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("splunk HEC error: %s", resp.Status)
+	}
+	return nil
+}
+
+func (hp *Honeypot) startWorkerPools() {
+	const (
+		suricataWorkers = 2
+		splunkWorkers   = 3
+	)
+	// Suricata workers
+	for i := 0; i < suricataWorkers; i++ {
+		go func() {
+			for evt := range hp.suricataJobs {
+				if err := hp.GeneratePCAPAndRunSuricata(evt); err != nil {
+					fmt.Println("[!] Suricata job error:", err)
+				}
+			}
+		}()
+	}
+	// Splunk HEC workers
+	for i := 0; i < splunkWorkers; i++ {
+		go func() {
+			for evt := range hp.splunkJobs {
+				if err := sendToSplunk(evt); err != nil {
+					fmt.Println("[!] Splunk job error:", err)
+				}
+			}
+		}()
+	}
 }
