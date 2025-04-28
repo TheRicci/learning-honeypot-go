@@ -91,6 +91,7 @@ func (hp *Honeypot) watchSuricataAlerts() {
 		case ev := <-watcher.Events:
 			if ev.Op&fsnotify.Create == fsnotify.Create {
 				name := filepath.Base(ev.Name)
+				//fmt.Println(name)
 				if strings.HasPrefix(name, "event-") {
 					evtID := strings.TrimPrefix(name, "event-")
 					if !seen[evtID] {
@@ -109,76 +110,106 @@ func (hp *Honeypot) watchSuricataAlerts() {
 }
 
 func (hp *Honeypot) processEveFile(evtID, evePath string) {
-	file, err := os.Open(evePath)
+	time.Sleep(1 * time.Second)
+	// Open once and keep track of how far we've read
+	f, err := os.Open(evePath)
 	if err != nil {
+		fmt.Printf("[!] failed to open eve.json (%s): %v\n", evePath, err)
 		return
 	}
-	defer file.Close()
+	defer f.Close()
 
-	reader := bufio.NewReader(file)
+	// Start at beginning
+	var offset int64
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		fmt.Println("[!] fsnotify error:", err)
+		return
+	}
+	defer watcher.Close()
 
+	if err := watcher.Add(evePath); err != nil {
+		fmt.Println("[!] fsnotify add error:", err)
+		return
+	}
+
+	buf := bufio.NewReader(f)
 	for {
-		line, err := reader.ReadBytes('\n')
-		if err != nil {
-			if err == io.EOF {
-				break
+		select {
+		case ev := <-watcher.Events:
+			if ev.Op&fsnotify.Write == fsnotify.Write {
+				// Seek to last offset
+				f.Seek(offset, io.SeekStart)
+				// Read all new lines
+				for {
+					line, err := buf.ReadBytes('\n')
+					if err == io.EOF {
+						break
+					} else if err != nil {
+						fmt.Println("[!] read error:", err)
+						break
+					}
+					offset += int64(len(line))
+
+					// Process JSON alert lines as before
+					var entry map[string]interface{}
+					if err := json.Unmarshal(line, &entry); err != nil {
+						continue
+					}
+
+					if entry["event_type"] != "alert" {
+						continue
+					}
+
+					srcIP := entry["src_ip"].(string)
+					destPort := int(entry["dest_port"].(float64))
+					alertData := entry["alert"].(map[string]interface{})
+					signature := alertData["signature"].(string)
+					category := alertData["category"].(string)
+					severity := int(alertData["severity"].(float64))
+					timestampStr := entry["timestamp"].(string)
+
+					t, _ := time.Parse(time.RFC3339Nano, timestampStr)
+
+					alert := SuricataAlert{
+						Signature: signature,
+						Category:  category,
+						Severity:  severity,
+						SrcIP:     srcIP,
+						DestPort:  destPort,
+						Timestamp: t,
+						EventID:   evtID,
+					}
+
+					fmt.Printf("[SURICATA] [EVENT-%s] [%s] %s:%d -> %s (%s, Severity %d)\n",
+						alert.EventID,
+						alert.Timestamp.Format(time.RFC3339),
+						alert.SrcIP,
+						alert.DestPort,
+						alert.Signature,
+						alert.Category,
+						alert.Severity,
+					)
+
+					fmt.Println("alert", alert)
+
+					hp.eventMutex.Lock()
+					hp.EventMap[evtID].SuricataData = append(hp.EventMap[evtID].SuricataData, &alert)
+					evt := hp.EventMap[evtID]
+					hp.eventMutex.Unlock()
+					hp.splunkJobs <- evt
+				}
 			}
-			fmt.Println("[!] Error reading eve.json:", err)
-			break
+
+		case err := <-watcher.Errors:
+			fmt.Println("[!] fsnotify watcher error:", err)
 		}
-
-		var entry map[string]interface{}
-		if err := json.Unmarshal(line, &entry); err != nil {
-			continue
-		}
-
-		/*
-			if entry["event_type"] != "alert" {
-				continue
-			}
-		*/
-
-		srcIP := entry["src_ip"].(string)
-		destPort := int(entry["dest_port"].(float64))
-		alertData := entry["alert"].(map[string]interface{})
-		signature := alertData["signature"].(string)
-		category := alertData["category"].(string)
-		severity := int(alertData["severity"].(float64))
-		timestampStr := entry["timestamp"].(string)
-
-		t, _ := time.Parse(time.RFC3339Nano, timestampStr)
-
-		alert := SuricataAlert{
-			Signature: signature,
-			Category:  category,
-			Severity:  severity,
-			SrcIP:     srcIP,
-			DestPort:  destPort,
-			Timestamp: t,
-			EventID:   evtID,
-		}
-
-		fmt.Printf("[SURICATA] [EVENT-%s] [%s] %s:%d -> %s (%s, Severity %d)\n",
-			alert.EventID,
-			alert.Timestamp.Format(time.RFC3339),
-			alert.SrcIP,
-			alert.DestPort,
-			alert.Signature,
-			alert.Category,
-			alert.Severity,
-		)
-
-		hp.eventMutex.Lock()
-		hp.EventMap[evtID].SuricataData = append(hp.EventMap[evtID].SuricataData, &alert)
-		evt := hp.EventMap[evtID]
-		hp.eventMutex.Unlock()
-		hp.splunkJobs <- evt
 	}
 }
 
 func (hp *Honeypot) listenOnPort(port int) {
 	addr := fmt.Sprintf(":%d", port)
-	ln, err := net.Listen("tcp", addr)
+	ln, err := net.Listen("tcp4", addr)
 	if err != nil {
 		fmt.Printf("[!] Error listening on port %d: %v\n", port, err)
 		return
@@ -244,7 +275,7 @@ func (hp *Honeypot) registerEvent(t time.Time, ip string, payload *string, port 
 
 func (hp *Honeypot) listenFTPS(port int) {
 	addr := fmt.Sprintf(":%d", port)
-	ln, err := net.Listen("tcp", addr)
+	ln, err := net.Listen("tcp4", addr)
 	if err != nil {
 		fmt.Printf("[!] Error listening on FTPS port %d: %v\n", port, err)
 		return
@@ -351,15 +382,37 @@ func (hp *Honeypot) startHTTPHoneypot(port int) {
 	mux.HandleFunc("/backup.zip", wrap(fakeDownload))
 	mux.HandleFunc("/shell.php", wrap(fakeShell))
 
-	addr := fmt.Sprintf(":%d", port)
-
+	addr := fmt.Sprintf("0.0.0.0:%d", port)
 	certFile := "cert.pem"
 	keyFile := "key.pem"
-	err := http.ListenAndServeTLS(addr, certFile, keyFile, mux)
+
+	// Load certificates
+	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		fmt.Printf("[!] Failed to load cert: %v\n", err)
+		return
+	}
+
+	// Create a TLS config
+	tlsConfig := &tls.Config{Certificates: []tls.Certificate{cert}}
+
+	// Listen only on IPv4
+	listener, err := net.Listen("tcp4", addr)
+	if err != nil {
+		fmt.Printf("[!] Listen error: %v\n", err)
+		return
+	}
+
+	// Wrap the listener with TLS
+	tlsListener := tls.NewListener(listener, tlsConfig)
+
+	fmt.Println("[*] HTTPS honeypot running on", addr)
+	// Start the server
+	err = http.Serve(tlsListener, mux)
 	if err != nil {
 		fmt.Printf("[!] HTTPS server error: %v\n", err)
+		return
 	}
-	fmt.Println("[*] HTTP honeypot running on", addr)
 }
 
 func sqlInjectionBait(w http.ResponseWriter, r *http.Request) string {
@@ -442,9 +495,13 @@ func (hp *Honeypot) GeneratePCAPAndRunSuricata(evt *Event) error {
 
 	err := WritePCAP(evt, pcapPath)
 	if err != nil {
-		return fmt.Errorf("error writing fake pcap: %v", err)
+		return fmt.Errorf("error writing pcap: %v", err)
 	}
 
+	err = os.Mkdir(fmt.Sprintf("/tmp/suricata-alerts/event-%s", evt.ID), 0777)
+	if err != nil {
+		return fmt.Errorf("event temp directory creation failed: %v", err)
+	}
 	cmd := exec.Command("suricata", "-r", pcapPath, "-l", fmt.Sprintf("/tmp/suricata-alerts/event-%s", evt.ID))
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -468,11 +525,11 @@ func WritePCAP(evt *Event, filepath string) error {
 	writer := pcapgo.NewWriter(f)
 	writer.WriteFileHeader(65536, layers.LinkTypeEthernet)
 
-	// Prepare addressing
 	srcIP := net.ParseIP(evt.IP)
 	if srcIP == nil {
 		srcIP = net.IPv4(192, 168, 1, 100)
 	}
+
 	dstIP := net.IPv4(192, 168, 1, 10)
 	srcPort := layers.TCPPort(12345)
 	dstPort := layers.TCPPort(evt.Port)
